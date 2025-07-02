@@ -9,6 +9,12 @@
 static int disk_file_descriptor = -1;
 static superblock current_superblock = {0}; // hold the superblock data in cache in memory
 
+// #### helper functions declaration #####
+int find_inode_by_name(const char* i_name);
+int find_free_inode();
+void write_inode_to_disk(int inode_index, const inode* i_node);
+int compare_strings(const char* str1, const char* str2);
+
 int fs_format(const char* disk_path)
 {
     //consts
@@ -132,4 +138,116 @@ void fs_unmount()
 
     close(disk_file_descriptor);
     disk_file_descriptor = -1; // reset the file descriptor
+}
+
+int fs_create(const char* filename)
+{
+    if(disk_file_descriptor < 0) {
+        return -3; // not mounted - general error (-3)
+    }
+
+    //check validation of the filename
+    if(filename == NULL || strlen(filename) == 0 || strlen(filename) > MAX_FILENAME) {
+        return -3; 
+    }
+
+    if(find_inode_by_name(filename) >= 0) {
+        return -1; // file already exists
+    }
+
+    int free_inode_index = find_free_inode();
+    if(free_inode_index < 0) {
+        return -2; // no free inodes - error code (-2)  
+    }
+    //TODO::Lavie - go over all the error codes and make sure they are consistent accourding to the HW file of all functions
+
+    //create the inode for the new file
+    inode new_inode = {0};
+    strncpy(new_inode.name, filename, sizeof(new_inode.name) - 1);
+    new_inode.used = 1; // mark as used
+
+    write_inode_to_disk(free_inode_index, &new_inode);
+
+    // update superblock and free inodes count
+    current_superblock.free_inodes--;
+    // write(disk_file_descriptor, &current_superblock, sizeof(superblock)); - we already write the superblock in fs_unmount so we dont should do it again
+
+    return 0; // hopa - success a new file was created :)
+}
+
+
+
+
+
+// #### helper functions #####
+int find_inode_by_name(const char* i_name)
+{
+    if(disk_file_descriptor < 0) {
+        return -1; 
+    }
+
+    inode current_inode;
+    for(int i = 0; i < MAX_FILES; i++) {
+        off_t cur_inode_pos = (2 * BLOCK_SIZE) + (i * sizeof(inode));
+        lseek(disk_file_descriptor, cur_inode_pos, SEEK_SET);
+
+        int count_of_reading_buf = read(disk_file_descriptor, &current_inode, sizeof(inode));
+        if(count_of_reading_buf != sizeof(inode)) {
+            return -1; // error while reading the inode
+        }
+
+        //looking for the inode with the given name
+        if(current_inode.used && compare_strings(current_inode.name, i_name) == 0) {
+            return i; // return the indx the inode
+        }
+    }
+    return -1; //there is no inode with this i_name
+}
+
+int compare_strings(const char* str1, const char* str2)
+{
+    if(str1 == NULL || str2 == NULL) {
+        return 0; // TODO::Adi - null == null -> True (?) - **should check this**
+    }
+
+    while (*str1 && *str1 == *str2)
+    {
+        str1++, str2++;
+    }
+
+    return *str1 - *str2;
+}
+
+int find_free_inode()
+{
+    if(disk_file_descriptor < 0) {
+        return -1;
+    }
+
+    inode current_inode;
+    for(int i = 0; i < MAX_FILES; i++) {
+        off_t cur_inode_pos = (2 * BLOCK_SIZE) + (i * sizeof(inode));
+        lseek(disk_file_descriptor, cur_inode_pos, SEEK_SET);
+
+        int count_of_reading_buf = read(disk_file_descriptor, &current_inode, sizeof(inode));
+        if(count_of_reading_buf != sizeof(inode)) {
+            return -1;
+        }
+
+        if(!current_inode.used) {
+            return i; //return the first free inode
+        }
+    }
+    return -1; // no free inodes available
+}
+
+void write_inode_to_disk(int i_inode_num, const inode* i_source) 
+{
+    if(disk_file_descriptor < 0 || i_inode_num < 0 || i_inode_num >= MAX_FILES) {
+        return; // invalid state
+    }
+
+    off_t cur_inode_pos = (2 * BLOCK_SIZE) + (i_inode_num * sizeof(inode));
+    lseek(disk_file_descriptor, cur_inode_pos, SEEK_SET);
+    write(disk_file_descriptor, i_source, sizeof(inode));
 }
