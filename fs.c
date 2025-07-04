@@ -210,6 +210,7 @@ int fs_list(char filenames[][MAX_FILENAME], int max_files)
 
         if(current_inode.used) {
             strncpy(filenames[num_of_files_found], current_inode.name, MAX_FILENAME);
+            filenames[num_of_files_found][MAX_FILENAME - 1] = '\0'; // ensure null termination
             num_of_files_found++;
         }
     }
@@ -260,8 +261,93 @@ int fs_write(const char* filename, const void* data, int size)
     
 }
 
+int fs_read(const char* filename, void* buffer, int size)
+{
+    if(disk_file_descriptor < 0) {
+        return -1; // maybe should be -3? - not mounted but if it is not mounted we cannot read the file so it also -1 error
+    }
 
+    if(filename == NULL || buffer == NULL || size <= 0 || strlen(filename) == 0 || strlen(filename) > MAX_FILENAME) {
+        return -3; // invalid parameters
+    }
 
+    int inode_index = find_inode_by_name(filename);
+    if(inode_index < 0) {
+        return -1; // file not found
+    }
+
+    inode current_file_inode;
+    read_inode_from_disk(inode_index, &current_file_inode);
+    // If requested size is larger than file size, only read available bytes
+    int bytes_to_read = (size < current_file_inode.size) ? size : current_file_inode.size;
+    if(bytes_to_read == 0) {
+        return 0; // nothing to read
+    }
+
+    int blocks_to_read = (bytes_to_read + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    // Read data from the allocated blocks
+    char* read_buffer = (char*)buffer;
+    int total_bytes_read = 0;
+
+    for(int i = 0; i < blocks_to_read; i++) {
+        int block_number = current_file_inode.blocks[i];
+
+        if(block_number < 10 || block_number >= MAX_BLOCKS) {
+            return -3; // invalid block index
+        }
+
+        int remaining_bytes = bytes_to_read - total_bytes_read;
+        int bytes_from_this_block = (remaining_bytes > BLOCK_SIZE) ? BLOCK_SIZE : remaining_bytes;
+        //temp buffer for reading all block data
+        char temp_block_buffer[BLOCK_SIZE] = {0};
+        off_t block_offset = block_number * BLOCK_SIZE;
+        if(lseek(disk_file_descriptor, block_offset, SEEK_SET) < 0) {
+            return -3;
+        }
+
+        //read full block data
+        int bytes_read = read(disk_file_descriptor, temp_block_buffer, BLOCK_SIZE);
+        if(bytes_read != BLOCK_SIZE) {
+            return -3;
+        }
+
+        //copy only the needed bytes to the read buffer
+        memcpy(read_buffer + total_bytes_read, temp_block_buffer, bytes_from_this_block);
+        total_bytes_read += bytes_from_this_block;
+    }
+    return total_bytes_read; 
+}
+
+int fs_delete(const char* filename)
+{
+    if(disk_file_descriptor < 0) {
+        return -2; // not mounted maybe should be -1 ? 
+    }
+
+    if(filename == NULL || strlen(filename) == 0 || strlen(filename) > MAX_FILENAME) {
+        return -2; 
+    }
+
+    int inode_index = find_inode_by_name(filename);
+    if(inode_index < 0) {
+        return -1; // file not found
+    }
+
+    inode file_inode_to_delete;
+    read_inode_from_disk(inode_index, &file_inode_to_delete);
+    // free the blocks allocated for the file
+    int free_blocks_result = free_file_existing_blocks(&file_inode_to_delete);
+    if(free_blocks_result < 0) {
+        return -2; 
+    }
+
+    memset(&file_inode_to_delete, 0, sizeof(inode)); // clear the inode data
+    file_inode_to_delete.used = 0; // mark inode as free
+    write_inode_to_disk(inode_index, &file_inode_to_delete);
+
+    current_superblock.free_inodes++;
+    return 0; 
+}
 
 
 
