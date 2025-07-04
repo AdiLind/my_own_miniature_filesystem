@@ -14,6 +14,20 @@ int find_inode_by_name(const char* i_name);
 int find_free_inode();
 void write_inode_to_disk(int inode_index, const inode* i_node);
 int compare_strings(const char* str1, const char* str2);
+void read_inode_from_disk(int i_inode_index, inode* i_inode_buffer);
+int find_free_block();
+void mark_block_as_used(int block_index);
+void mark_block_as_free(int block_index);
+int validate_block_number_and_filesystem(int i_block_num);
+int read_bitmap_from_disk(unsigned char* i_bitmap_buffer);
+int write_bitmap_to_disk(const unsigned char* i_bitmap_buffer);
+//fs_writer helper functions declaration
+int validate_write_operation_parameters(const char* filename, const void* data, int size);
+int check_available_space_for_write_operation(int blocks_needed, int current_file_size);
+int free_file_existing_blocks(inode* file_inode);
+int allocate_blocks_for_file(inode* file_inode, int blocks_needed);
+int write_data_to_allocated_blocks(inode* file_inode, const void* data, int size, int blocks_needed);
+
 
 int fs_format(const char* disk_path)
 {
@@ -175,6 +189,78 @@ int fs_create(const char* filename)
     return 0; // hopa - success a new file was created :)
 }
 
+int fs_list(char filenames[][MAX_FILENAME], int max_files)
+{
+    if(disk_file_descriptor < 0) {
+        return -1;
+    }
+
+    inode current_inode;
+    int num_of_files_found = 0;
+
+    for(int i = 0; i < MAX_FILES && num_of_files_found < max_files; i++) {
+        off_t cur_inode_pos = (2 * BLOCK_SIZE) + (i * sizeof(inode));
+        lseek(disk_file_descriptor, cur_inode_pos, SEEK_SET);
+
+        int count_of_reading_buf = read(disk_file_descriptor, &current_inode, sizeof(inode));
+        
+        if(count_of_reading_buf != sizeof(inode)) {
+            return -1; 
+        }
+
+        if(current_inode.used) {
+            strncpy(filenames[num_of_files_found], current_inode.name, MAX_FILENAME);
+            num_of_files_found++;
+        }
+    }
+    return num_of_files_found; 
+}
+
+int fs_write(const char* filename, const void* data, int size)
+{
+   int isValidInput = validate_write_operation_parameters(filename, data, size);
+    if(isValidInput != 0) {
+        return isValidInput; // return the error code
+    }
+
+    int inode_index = find_inode_by_name(filename);
+    if(inode_index < 0) {
+        return -1; // file not found
+    }
+
+    inode current_file_inode;
+    read_inode_from_disk(inode_index, &current_file_inode);
+
+    int blocks_needed = (size + BLOCK_SIZE - 1) / BLOCK_SIZE; 
+    int free_space_check = check_available_space_for_write_operation(blocks_needed, current_file_inode.size);
+    if(free_space_check < 0) {
+        return free_space_check; // return the error code
+    }
+
+    // free existing blocks if the file is being resized
+    int free_blocks_result = free_file_existing_blocks(&current_file_inode);
+    if(free_blocks_result < 0) {
+        return free_blocks_result; // return the error code
+    }
+    // allocate new blocks for the file
+    int allocate_blocks_result = allocate_blocks_for_file(&current_file_inode, blocks_needed);
+    if(allocate_blocks_result < 0) {
+        return allocate_blocks_result; 
+    }
+
+    int write_data_result = write_data_to_allocated_blocks(&current_file_inode, data, size, blocks_needed);
+    if(write_data_result < 0) {
+        return write_data_result; 
+    }
+
+    current_file_inode.size = size;
+    write_inode_to_disk(inode_index, &current_file_inode);
+
+    return 0;
+    
+}
+
+
 
 
 
@@ -241,13 +327,236 @@ int find_free_inode()
     return -1; // no free inodes available
 }
 
-void write_inode_to_disk(int i_inode_num, const inode* i_source) 
+
+int find_free_block()
 {
-    if(disk_file_descriptor < 0 || i_inode_num < 0 || i_inode_num >= MAX_FILES) {
-        return; // invalid state
+    if (validate_block_number_and_filesystem(0) != 0) {
+        return -1;
     }
 
-    off_t cur_inode_pos = (2 * BLOCK_SIZE) + (i_inode_num * sizeof(inode));
-    lseek(disk_file_descriptor, cur_inode_pos, SEEK_SET);
-    write(disk_file_descriptor, i_source, sizeof(inode));
+    unsigned char block_allocation_bitmap[BLOCK_SIZE];
+    if (read_bitmap_from_disk(block_allocation_bitmap) != 0) {
+        return -1; // error reading bitmap
+    }
+
+    //LOOKING FOR THE FIRST FREE BLOCK
+    // we start looking from block 10 because blocks 0-9 are used for superblock, bitmap and inode table
+    for(int block_index = 10; block_index < MAX_BLOCKS; block_index++) 
+    {
+        if(!(block_allocation_bitmap[block_index / 8] & (1 << (block_index % 8)))) 
+        {
+            return block_index; 
+        }
+    }
+    return -1; //didnt found a free block available
 }
+
+void write_inode_to_disk(int inode_index, const inode* i_node)
+{
+    if(disk_file_descriptor < 0 || inode_index < 0 || inode_index >= MAX_FILES || i_node == NULL) 
+    {
+        return;
+    }
+
+    off_t cur_inode_pos = (2 * BLOCK_SIZE) + (inode_index * sizeof(inode));
+    lseek(disk_file_descriptor, cur_inode_pos, SEEK_SET);
+    write(disk_file_descriptor, i_node, sizeof(inode));
+}
+
+void mark_block_as_used(int block_index)
+{
+    if (validate_block_number_and_filesystem(block_index) != 0) {
+        return; // invalid parameters
+    }
+
+    unsigned char block_allocation_bitmap[BLOCK_SIZE];
+    if (read_bitmap_from_disk(block_allocation_bitmap) != 0) {
+        return; // error reading bitmap
+    }
+
+
+    //mark the block as used (bit =1) (from the task instructions - bitwise manipulation)
+    block_allocation_bitmap[block_index / 8] |= (1 << (block_index % 8));
+    write_bitmap_to_disk(block_allocation_bitmap);
+}
+
+void mark_block_as_free(int block_index)
+{
+    if (validate_block_number_and_filesystem(block_index) != 0) {
+        return; 
+    }
+    unsigned char block_allocation_bitmap[BLOCK_SIZE];
+    if (read_bitmap_from_disk(block_allocation_bitmap) != 0) {
+        return; // error reading bitmap
+    }
+
+    //mark the block as free (bit =0) from the task instructions - bitwise manipulation)
+    block_allocation_bitmap[block_index / 8] &= ~(1 << (block_index % 8));
+    write_bitmap_to_disk(block_allocation_bitmap);
+}
+
+int validate_block_number_and_filesystem(int i_block_num)
+{
+    if(disk_file_descriptor < 0 || i_block_num < 0 || i_block_num >= MAX_BLOCKS) 
+    {
+        return -1;
+    }
+
+    return 0; // valid block number and filesystem
+}
+
+int read_bitmap_from_disk(unsigned char* i_bitmap_buffer)
+{
+    if(disk_file_descriptor < 0 || i_bitmap_buffer == NULL) 
+    {
+        return -1;
+    }
+
+    lseek(disk_file_descriptor, BLOCK_SIZE, SEEK_SET);
+    int num_of_reading_byte = read(disk_file_descriptor, i_bitmap_buffer, BLOCK_SIZE);
+    if(num_of_reading_byte != BLOCK_SIZE) 
+    {
+        return -1;
+    }
+
+    return 0; 
+}
+
+int write_bitmap_to_disk(const unsigned char* i_bitmap_buffer)
+{
+    if(disk_file_descriptor < 0 || i_bitmap_buffer == NULL) 
+    {
+        return -1;
+    }
+
+    lseek(disk_file_descriptor, BLOCK_SIZE, SEEK_SET);
+    int num_of_writing_byte = write(disk_file_descriptor, i_bitmap_buffer, BLOCK_SIZE);
+    if(num_of_writing_byte != BLOCK_SIZE) 
+    {
+        return -1;
+    }
+
+    return 0; 
+}
+
+
+void read_inode_from_disk(int i_inode_index, inode* i_inode_buffer)
+{
+    if(disk_file_descriptor < 0 || i_inode_index < 0 || i_inode_index >= MAX_FILES || i_inode_buffer == NULL) 
+    {
+        return; // invalid parameters
+    }
+
+    off_t cur_inode_pos = (2 * BLOCK_SIZE) + (i_inode_index * sizeof(inode));
+    lseek(disk_file_descriptor, cur_inode_pos, SEEK_SET);
+    read(disk_file_descriptor, i_inode_buffer, sizeof(inode));
+}
+
+int validate_write_operation_parameters(const char* filename, const void* data, int size) 
+{
+    if(disk_file_descriptor < 0) {
+        return -3; // not mounted
+    }
+
+    if(filename == NULL || data == NULL || size <= 0 || strlen(filename) == 0 || strlen(filename) > MAX_FILENAME) {
+        return -3; // invalid parameters
+    }
+
+    //maximum file size limit is using all the 12 blocks * 4KB = 48KB)
+    if (size > MAX_DIRECT_BLOCKS * BLOCK_SIZE) {
+        return -2; // file too large for the filesystem
+    }
+    
+    return 0; // validation passed
+}
+
+int check_available_space_for_write_operation(int blocks_needed, int current_file_size) 
+{
+    int current_file_blocks = (current_file_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (blocks_needed > current_superblock.free_blocks + current_file_blocks) {
+        return -2; // not enough space available
+    }
+    
+    return 0; // enough space
+}
+
+int free_file_existing_blocks(inode* file_inode) 
+{
+    if (file_inode == NULL) {
+        return -3; // invalid parameter
+    }
+    
+    int old_blocks_count = (file_inode->size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    for (int i = 0; i < old_blocks_count; i++) {
+        if (file_inode->blocks[i] != 0 && file_inode->blocks[i] < MAX_BLOCKS) {
+            mark_block_as_free(file_inode->blocks[i]);
+            current_superblock.free_blocks++;
+            file_inode->blocks[i] = 0; // clear the pointer
+        }
+        
+    }
+    
+    return 0;
+}
+
+int allocate_blocks_for_file(inode* file_inode, int blocks_needed) 
+{
+    if (file_inode == NULL || blocks_needed <= 0) {
+        return -3; 
+    }
+    
+    //allocate the new blocks we need
+    for (int block_iterator = 0; block_iterator < blocks_needed; block_iterator++) {
+        int new_block_number = find_free_block();
+        if (new_block_number < 0) { //we didnt find a free block while we allready allocated some blocks
+            //we need to free the blocks we already allocated
+            for (int rollback_iterator = 0; rollback_iterator < block_iterator; rollback_iterator++) {
+                mark_block_as_free(file_inode->blocks[rollback_iterator]);
+                current_superblock.free_blocks++;
+                file_inode->blocks[rollback_iterator] = 0;
+            }
+            return -2; // allocation failed
+        }
+        
+        mark_block_as_used(new_block_number);
+        file_inode->blocks[block_iterator] = new_block_number;
+        current_superblock.free_blocks--;
+    }
+    
+    return 0; // success
+    
+}
+
+int write_data_to_allocated_blocks(inode* file_inode, const void* data, int size, int blocks_needed) 
+{
+    if (file_inode == NULL || data == NULL || size <= 0 || blocks_needed <= 0) {
+        return -3;
+    }
+    
+    const char* data_bytes = (const char*)data;
+    int bytes_written = 0;
+    
+    for (int block_iterator = 0; block_iterator < blocks_needed; block_iterator++) {
+        int block_number = file_inode->blocks[block_iterator];
+        
+        // Calculate bytes to write in this block
+        int bytes_to_write_in_this_block = (size - bytes_written > BLOCK_SIZE) ? BLOCK_SIZE : (size - bytes_written);
+        
+        char block_buffer[BLOCK_SIZE];
+        memset(block_buffer, 0, BLOCK_SIZE);  //adding 0 for partial blocks
+        //copy data to buffer
+        memcpy(block_buffer, data_bytes + bytes_written, bytes_to_write_in_this_block);
+        
+        //write block to disk
+        off_t block_position = block_number * BLOCK_SIZE;
+        lseek(disk_file_descriptor, block_position, SEEK_SET);
+        if (write(disk_file_descriptor, block_buffer, BLOCK_SIZE) != BLOCK_SIZE) {
+            return -3; //other error
+        }
+        
+        bytes_written += bytes_to_write_in_this_block;
+    }
+    
+    return 0;
+}
+    
