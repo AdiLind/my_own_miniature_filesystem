@@ -321,7 +321,7 @@ int fs_read(const char* filename, void* buffer, int size)
 int fs_delete(const char* filename)
 {
     if(disk_file_descriptor < 0) {
-        return -2; // not mounted maybe should be -1 ? 
+        return -1;  
     }
 
     if(filename == NULL || strlen(filename) == 0 || strlen(filename) > MAX_FILENAME) {
